@@ -25,12 +25,12 @@ services:
         value: "2.0"
       - key: BINANCE_REF
         value: "1164241722"
+
   - type: cron
     name: alphaflow-scanner
     env: python
-    plan: free
     region: frankfurt
-    schedule: "*/10 * * * *"
+    schedule: "*/10 * * * *"   # every 10 minutes
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
@@ -38,4 +38,4 @@ services:
       python scanner.py
     envVars:
       - key: SERVICE_URL
-        value: "https://alphaflow-worker.onrender.com"
+        value: "https://alphaflow-worker.onrender.com"   # update to your real URL after first deploy
