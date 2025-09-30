@@ -1,0 +1,298 @@
+import os
+from typing import Any, Dict, Optional, List
+from fastapi import FastAPI, Request, HTTPException
+import httpx
+
+app = FastAPI(title="AlphaFlow Worker Discord")
+
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+CHAN_FREE = os.environ.get("DISCORD_CHANNEL_FREE", "")
+CHAN_PRO  = os.environ.get("DISCORD_CHANNEL_PRO", "")
+
+DEFAULT_STOP_ATR = float(os.environ.get("DEFAULT_STOP_ATR", "1.5"))
+DEFAULT_TP1_RR   = float(os.environ.get("DEFAULT_TP1_RR", "1.0"))
+DEFAULT_TP2_RR   = float(os.environ.get("DEFAULT_TP2_RR", "2.0"))
+
+# ------------ helpers ------------
+def _dir(side: str) -> int:
+    return 1 if str(side).upper() in ("BUY", "LONG") else -1
+
+def _fmt(n: Optional[float]) -> str:
+    if n is None: return "—"
+    return f"{float(n):.6f}".rstrip("0").rstrip(".")
+
+def tradingview_url(exchange: Optional[str], tv_symbol: Optional[str], symbol: Optional[str]) -> Optional[str]:
+    if tv_symbol and ":" in tv_symbol:
+        return f"https://www.tradingview.com/chart/?symbol={tv_symbol}"
+    if exchange and symbol:
+        return f"https://www.tradingview.com/chart/?symbol={exchange}:{symbol}"
+    return None
+
+def rr_value(price: Optional[float], stop: Optional[float], tp: Optional[float]) -> Optional[float]:
+    if price is None or stop is None or tp is None: return None
+    risk = abs(price - stop)
+    if risk <= 0: return None
+    return abs(tp - price) / risk
+
+def compute_levels(p: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    side  = (p.get("side") or "BUY").upper()
+    price = p.get("price")
+    stop  = p.get("stop")
+    tp1   = p.get("tp1")
+    tp2   = p.get("tp2")
+    tech  = p.get("technicals") or {}
+    atr   = tech.get("atr")
+
+    if price is None:
+        return {"price": None, "stop": stop, "tp1": tp1, "tp2": tp2}
+
+    if atr and (stop is None or tp1 is None or tp2 is None):
+        d = _dir(side)
+        if stop is None:
+            stop = price - d * (DEFAULT_STOP_ATR * float(atr))
+        risk = abs(price - stop) if stop is not None else None
+        if risk and tp1 is None: tp1 = price + d * (risk * DEFAULT_TP1_RR)
+        if risk and tp2 is None: tp2 = price + d * (risk * DEFAULT_TP2_RR)
+    return {"price": price, "stop": stop, "tp1": tp1, "tp2": tp2}
+
+def estimate_confidence(p: Dict[str, Any], rr1: Optional[float], rr2: Optional[float]) -> int:
+    # 0..100 simple heuristic if user didn't provide one
+    if "confidence" in p and p["confidence"] is not None:
+        c = p["confidence"]
+        try:
+            # accept 0..1 or 0..100
+            if 0 <= float(c) <= 1: return max(0, min(100, round(float(c) * 100)))
+            return max(0, min(100, round(float(c))))
+        except Exception:
+            pass
+
+    tech = p.get("technicals") or {}
+    side = (p.get("side") or "BUY").upper()
+
+    score = 50
+    # RR weighting
+    if rr1: score += min(20, (rr1 - 1.0) * 10)
+    if rr2: score += min(10, (rr2 - 2.0) * 5)
+
+    # EMA alignment
+    ef, es = tech.get("ema_fast"), tech.get("ema_slow")
+    try:
+        if ef is not None and es is not None:
+            ef, es = float(ef), float(es)
+            if side in ("BUY","LONG") and ef > es: score += 10
+            if side in ("SELL","SHORT") and ef < es: score += 10
+    except Exception:
+        pass
+
+    # RSI tilt
+    try:
+        rsi = float(tech.get("rsi")) if tech.get("rsi") is not None else None
+        if rsi is not None:
+            if side in ("BUY","LONG"):
+                if rsi >= 55: score += 7
+                elif rsi <= 45: score -= 7
+            else:
+                if rsi <= 45: score += 7
+                elif rsi >= 55: score -= 7
+    except Exception:
+        pass
+
+    return max(5, min(95, int(round(score))))
+
+# ------ logos & links ------
+MAJOR_ICON = {
+    "BTC": "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/btc.png",
+    "ETH": "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/eth.png",
+    "SOL": "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/sol.png",
+    "BNB": "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/bnb.png",
+    "XRP": "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/xrp.png",
+    "DOGE":"https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/doge.png",
+    "ADA": "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/ada.png",
+    "AVAX":"https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/avax.png",
+    "LINK":"https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/link.png",
+    "TON": "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/ton.png",
+}
+
+def guess_base(sym_or_pair: str) -> Optional[str]:
+    s = (sym_or_pair or "").upper()
+    for q in ("USDT","USDC","BUSD","USD","BTC","ETH"):
+        if s.endswith(q) and len(s) > len(q)+1:
+            return s[:-len(q)]
+    if 2 <= len(s) <= 5:
+        return s
+    return None
+
+def guess_logo_url(p: Dict[str, Any]) -> Optional[str]:
+    if p.get("logo_url"):  # manual override
+        return p["logo_url"]
+
+    chain = (p.get("chain") or "").lower()
+    addr  = p.get("address") or p.get("mint") or p.get("token_address")
+    sym   = (p.get("symbol") or "").upper()
+    tv    = p.get("tv_symbol") or ""
+
+    # Solana SPL token by mint (PNG)
+    if chain == "solana" and addr:
+        return f"https://assets.trustwalletapp.com/blockchains/solana/assets/{addr}/logo.png"
+
+    # EVM token by contract (TrustWallet ethereum)
+    if addr and (chain in ("ethereum","eth","base","arbitrum","polygon","matic","optimism","bsc","binance-smart-chain","avalanche")):
+        # Most networks keep token logos in ethereum dir only for ERC-20.
+        return f"https://assets.trustwalletapp.com/blockchains/ethereum/assets/{addr}/logo.png"
+
+    # Majors by base ticker
+    for candidate in filter(None, [sym, tv.split(":")[-1] if ":" in tv else tv]):
+        base = guess_base(candidate)
+        if base and base in MAJOR_ICON:
+            return MAJOR_ICON[base]
+
+    # Fallback to community icon set (many tickers available)
+    base = guess_base(sym) or (guess_base(tv.split(":")[-1]) if ":" in tv else None)
+    if base:
+        low = base.lower()
+        return f"https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/{low}.png"
+
+    return None
+
+def build_links(p: Dict[str, Any]) -> List[str]:
+    links: List[str] = []
+    tv = tradingview_url(p.get("exchange"), p.get("tv_symbol"), p.get("symbol"))
+    if tv: links.append(f"[TradingView]({tv})")
+
+    chain = (p.get("chain") or "").lower()
+    addr  = p.get("address") or p.get("mint") or p.get("token_address")
+    sym   = (p.get("symbol") or "").upper()
+
+    if chain == "solana" and addr:
+        links.append(f"[Jupiter](https://jup.ag/swap/SOL-{addr})")
+        links.append(f"[Birdeye](https://birdeye.so/token/{addr}?chain=solana)")
+        links.append(f"[DexScreener](https://dexscreener.com/solana/{addr})")
+    elif addr:
+        netmap = {
+            "ethereum":"ethereum","eth":"ethereum",
+            "base":"base",
+            "arbitrum":"arbitrum",
+            "optimism":"optimism",
+            "polygon":"polygon","matic":"polygon",
+            "bsc":"bsc","binance-smart-chain":"bsc",
+            "avalanche":"avalanche"
+        }
+        net = netmap.get(chain)
+        if net:
+            links.append(f"[DexScreener](https://dexscreener.com/{net}/{addr})")
+            if net in ("ethereum","base","arbitrum","optimism","polygon"):
+                links.append(f"[Uniswap](https://app.uniswap.org/explore/tokens/{net}/{addr})")
+            elif net == "bsc":
+                links.append(f"[PancakeSwap](https://pancakeswap.finance/info/v3/tokens/{addr})")
+            elif net == "avalanche":
+                links.append(f"[TraderJoe](https://traderjoexyz.com/avalanche/pool/{addr})")
+    else:
+        # CEX pairs – add a generic symbol page on TradingView if we can infer base
+        base = guess_base(sym)
+        if base:
+            links.append(f"[Markets on TV](https://www.tradingview.com/symbols/{base}-USD/)")
+
+    return links
+
+# ------------ Discord ------------
+def build_embed(payload: Dict[str, Any], source: str) -> Dict[str, Any]:
+    symbol     = payload.get("symbol", "—")
+    exchange   = payload.get("exchange")
+    tv_symbol  = payload.get("tv_symbol")
+    timeframe  = payload.get("timeframe", "—")
+    side       = (payload.get("side") or "BUY").upper()
+    reason     = payload.get("reason") or "Automated setup"
+    tech       = payload.get("technicals") or {}
+
+    lv = compute_levels(payload)
+    price, stop, tp1, tp2 = lv["price"], lv["stop"], lv["tp1"], lv["tp2"]
+    rr1 = rr_value(price, stop, tp1)
+    rr2 = rr_value(price, stop, tp2)
+    conf = estimate_confidence(payload, rr1, rr2)
+
+    title = f"{symbol} • {side} • {timeframe}"
+    url   = tradingview_url(exchange, tv_symbol, symbol)
+    color = 0x19FD8D if side in ("BUY","LONG") else 0xF04F4F
+
+    fields = [
+        {"name":"Price","value":_fmt(price),"inline":True},
+        {"name":"Stop","value":_fmt(stop),"inline":True},
+        {"name":"TP1","value":_fmt(tp1),"inline":True},
+        {"name":"TP2","value":_fmt(tp2),"inline":True},
+        {"name":"Confidence","value":f"{conf} / 100","inline":True},
+    ]
+
+    rr_txt = []
+    if rr1 is not None: rr_txt.append(f"TP1 RR {_fmt(rr1)}")
+    if rr2 is not None: rr_txt.append(f"TP2 RR {_fmt(rr2)}")
+    if rr_txt: fields.append({"name":"Risk/Reward","value":" • ".join(rr_txt),"inline":True})
+
+    if tech:
+        parts = []
+        for k in ("rsi","ema_fast","ema_slow","atr","sma","vwma","rr"):
+            if k in tech:
+                try: parts.append(f"{k.upper()} {_fmt(float(tech[k]))}")
+                except Exception: parts.append(f"{k.upper()} {tech[k]}")
+        if parts:
+            fields.append({"name":"Technicals","value":"  |  ".join(parts),"inline":False})
+
+    link_parts = build_links(payload)
+    if link_parts:
+        fields.append({"name":"Links","value":" • ".join(link_parts), "inline":False})
+
+    author_name = f"AlphaFlow • {source or 'signal'}"
+    logo = guess_logo_url(payload)
+
+    embed: Dict[str, Any] = {
+        "title": title, "type":"rich", "color": color,
+        "description": reason, "fields": fields,
+        "footer": {"text": f"{exchange or 'Spot'} • {timeframe}"},
+    }
+    if url: embed["url"] = url
+    if logo:
+        embed["thumbnail"] = {"url": logo}
+        embed["author"] = {"name": author_name, "icon_url": logo}
+    else:
+        embed["author"] = {"name": author_name}
+    return embed
+
+async def post_to_discord(channel_id: str, embed: Dict[str, Any]) -> Dict[str, Any]:
+    if not DISCORD_BOT_TOKEN:
+        raise HTTPException(status_code=500, detail="DISCORD_BOT_TOKEN not set")
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(url, headers=headers, json={"embeds":[embed]})
+        if r.status_code >= 300:
+            try: err = r.json()
+            except Exception: err = {"text": r.text}
+            raise HTTPException(status_code=500, detail={"discord_status": r.status_code, "error": err})
+    return {"ok": True}
+
+def pick_channel(tier: Optional[str]) -> str:
+    t = (tier or "").lower()
+    if t in ("pro","premium","paid"):
+        return CHAN_PRO or CHAN_FREE
+    return CHAN_FREE or CHAN_PRO
+
+# ------------ routes ------------
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+@app.post("/send")
+async def send(req: Request):
+    body = await req.json()
+    if "payload" in body:
+        tier = body.get("tier")
+        source = body.get("source") or "signal"
+        payload = body["payload"]
+    else:
+        tier = body.get("tier")
+        source = body.get("source") or "signal"
+        payload = body
+    channel_id = pick_channel(tier)
+    if not channel_id:
+        raise HTTPException(status_code=500, detail="No Discord channel configured")
+    embed = build_embed(payload, source)
+    return await post_to_discord(channel_id, embed)

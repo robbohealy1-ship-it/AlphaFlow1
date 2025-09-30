@@ -1,0 +1,382 @@
+cat > ~/trading/mnq_ai_bot.py <<'PY'
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, os, sys, pickle
+from dataclasses import dataclass
+from typing import Optional, Tuple, List
+import numpy as np, pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+
+try:
+from sklearn.metrics import classification_report, roc_auc_score
+except Exception:
+classification_report = None
+roc_auc_score = None
+
+try:
+import yaml
+except Exception:
+yaml = None
+
+TA_AVAILABLE = False
+FORCE_FALLBACK_TA = True
+try:
+from ta.momentum import RSIIndicator as _TA_RSI
+from ta.trend import EMAIndicator as _TA_EMA
+TA_AVAILABLE = True
+except Exception:
+TA_AVAILABLE = False
+
+def _ema_fallback(close: pd.Series, window: int) -> pd.Series:
+return close.ewm(span=window, adjust=False).mean()
+
+def _rsi_fallback(close: pd.Series, window: int = 14) -> pd.Series:
+delta = close.diff()
+up = delta.clip(lower=0.0)
+down = -delta.clip(upper=0.0)
+roll_up = up.ewm(alpha=1/window, adjust=False).mean()
+roll_down = down.ewm(alpha=1/window, adjust=False).mean()
+rs = roll_up / (roll_down.replace(0, np.nan))
+rsi = 100 - (100 / (1 + rs))
+return rsi.fillna(50.0)
+
+try:
+from ib_insync import IB, Future, MarketOrder, LimitOrder
+IB_AVAILABLE = True
+except Exception:
+IB_AVAILABLE = False
+
+try:
+import yfinance as yf
+YF_AVAILABLE = True
+except Exception:
+YF_AVAILABLE = False
+
+@dataclass
+class Instrument:
+symbol: str
+tick_size: float
+tick_value: float
+multiplier: float
+
+MNQ = Instrument('MNQ', 0.25, 0.50, 2.0)
+NQ = Instrument('NQ', 0.25, 5.00, 20.0)
+INSTRUMENTS = {'MNQ': MNQ, 'NQ': NQ}
+
+def to_timeframe(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+if tf.lower() in ('1min','1m','1'): return df.copy()
+rule = tf.lower().replace('min','t').replace('m','t')
+o = df['open'].resample(rule).first()
+h = df['high'].resample(rule).max()
+l = df['low'].resample(rule).min()
+c = df['close'].resample(rule).last()
+v = df['volume'].resample(rule).sum()
+return pd.concat({'open':o,'high':h,'low':l,'close':c,'volume':v}, axis=1).dropna()
+
+def compute_pivots(df: pd.DataFrame) -> pd.DataFrame:
+day = df.copy(); day['date'] = day.index.date
+daily = day.groupby('date').agg({'high':'max','low':'min','close':'last'})
+prev = daily.shift(1)
+PP = (prev['high']+prev['low']+prev['close'])/3.0
+R1 = 2*PP - prev['low']; S1 = 2*PP - prev['high']
+R2 = PP + (prev['high']-prev['low']); S2 = PP - (prev['high']-prev['low'])
+R3 = prev['high'] + 2*(PP - prev['low']); S3 = prev['low'] - 2*(prev['high']-PP)
+piv = pd.concat({'PP':PP,'R1':R1,'S1':S1,'R2':R2,'S2':S2,'R3':R3,'S3':S3}, axis=1)
+piv.index = pd.to_datetime(piv.index)
+return piv.reindex(df.index, method='ffill')
+
+def compute_pdh_pdl(df: pd.DataFrame) -> pd.DataFrame:
+day = df.copy(); day['date'] = day.index.date
+daily = day.groupby('date').agg({'high':'max','low':'min'})
+pdh = daily['high'].shift(1); pdl = daily['low'].shift(1)
+out = pd.concat({'PDH':pdh,'PDL':pdl}, axis=1); out.index = pd.to_datetime(out.index)
+return out.reindex(df.index, method='ffill')
+
+def detect_fvg(df: pd.DataFrame) -> pd.DataFrame:
+high_m2 = df['high'].shift(2); low_m2 = df['low'].shift(2)
+fvg_up = (df['low']>high_m2).astype(int); fvg_dn = (df['high']<low_m2).astype(int)
+gap_up = (df['low']-high_m2).clip(lower=0.0); gap_dn = (low_m2-df['high']).clip(lower=0.0)
+return pd.DataFrame({'fvg_up':fvg_up,'fvg_dn':fvg_dn,'fvg_gap_up':gap_up,'fvg_gap_dn':gap_dn}, index=df.index)
+
+def detect_liquidity_sweep(df: pd.DataFrame, pdh: pd.Series, pdl: pd.Series) -> pd.DataFrame:
+sweep_up = ((df['high']>pdh) & (df['close']<pdh)).astype(int)
+sweep_dn = ((df['low']<pdl) & (df['close']>pdl)).astype(int)
+return pd.DataFrame({'sweep_up':sweep_up,'sweep_dn':sweep_dn}, index=df.index)
+
+def simple_order_block_proxy(df: pd.DataFrame, lookback:int=20)->pd.DataFrame:
+rng = (df['high']-df['low']).rolling(lookback).mean()
+big = (df['high']-df['low'])>(1.5*rng)
+prev_high = df['high'].rolling(lookback).max().shift(1)
+prev_low = df['low'].rolling(lookback).min().shift(1)
+ob_bull = (big & (df['close']>prev_high)).astype(int)
+ob_bear = (big & (df['close']<prev_low)).astype(int)
+return pd.DataFrame({'ob_bull':ob_bull,'ob_bear':ob_bear}, index=df.index)
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+use_fallback = (not TA_AVAILABLE) or FORCE_FALLBACK_TA
+if not use_fallback:
+try:
+rsi = _TA_RSI(close=df['close'], window=14).rsi()
+ema20 = _TA_EMA(close=df['close'], window=20).ema_indicator()
+ema50 = _TA_EMA(close=df['close'], window=50).ema_indicator()
+except Exception:
+rsi = _rsi_fallback(df['close'],14); ema20 = _ema_fallback(df['close'],20); ema50 = _ema_fallback(df['close'],50)
+else:
+rsi = _rsi_fallback(df['close'],14); ema20 = _ema_fallback(df['close'],20); ema50 = _ema_fallback(df['close'],50)
+vol_ma = df['volume'].rolling(20).mean()
+out = pd.DataFrame({'rsi':rsi,'ema20':ema20,'ema50':ema50,'vol_ma20':vol_ma}, index=df.index)
+out['trend_up'] = (out['ema20']>out['ema50']).astype(int)
+out['trend_dn'] = (out['ema20']<out['ema50']).astype(int)
+return out
+
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+piv = compute_pivots(df); pdhpdl = compute_pdh_pdl(df); fvg = detect_fvg(df)
+sweeps = detect_liquidity_sweep(df, pdhpdl['PDH'], pdhpdl['PDL'])
+ind = add_indicators(df); ob = simple_order_block_proxy(df)
+feats = pd.concat([piv,pdhpdl,fvg,sweeps,ob,ind], axis=1).dropna()
+return feats
+
+def make_labels(df: pd.DataFrame, horizon:int=5, thr_ticks:float=8.0, tick_size:float=0.25)->pd.Series:
+thr = thr_ticks*tick_size
+fwd = df['close'].shift(-horizon)-df['close']
+y = pd.Series(np.where(fwd>=thr,1,np.where(fwd<=-thr,-1,0)), index=df.index)
+return y
+
+def rule_signal(df: pd.DataFrame, feats: pd.DataFrame) -> pd.Series:
+close = df['close'].reindex(feats.index); PP = feats['PP']
+long_sig = (feats['sweep_dn']==1) & (feats['fvg_up']==1) & (feats['trend_up']==1) & (close>PP)
+short_sig= (feats['sweep_up']==1) & (feats['fvg_dn']==1) & (feats['trend_dn']==1) & (close<PP)
+sig = pd.Series(0, index=feats.index, dtype=int); sig[long_sig]=1; sig[short_sig]=-1; return sig
+
+def train_model(feats: pd.DataFrame, labels: pd.Series, n_estimators:int=200, random_state:int=42)->Tuple[RandomForestClassifier,List[str]]:
+X = feats.values; y = labels.values
+mask = y!=0; X = X[mask]; y = y[mask]
+if len(np.unique(y))<2: raise RuntimeError("Not enough class variety to train the model. Check your data/labels.")
+model = RandomForestClassifier(n_estimators=n_estimators, max_depth=7, min_samples_leaf=5, n_jobs=-1, random_state=random_state)
+tscv = TimeSeriesSplit(n_splits=5)
+try:
+aucs = cross_val_score(model, X, y, cv=tscv, scoring='roc_auc_ovr')
+print(f"TimeSeries CV ROC-AUC: mean={aucs.mean():.3f} +/- {aucs.std():.3f}")
+except Exception:
+pass
+model.fit(X,y); return model, list(feats.columns)
+
+def hybrid_signal(model: RandomForestClassifier, feats: pd.DataFrame, rule_sig: pd.Series, prob_th:float=0.55)->pd.Series:
+try:
+proba = model.predict_proba(feats.values)
+p_long = proba[:,1]; p_short = proba[:,0]
+ml_sig = pd.Series(0, index=feats.index, dtype=int)
+ml_sig[p_long>=prob_th]=1; ml_sig[p_short>=prob_th]=-1
+except Exception:
+return rule_sig
+out = pd.Series(0, index=feats.index, dtype=int)
+out[(rule_sig==1)&(ml_sig==1)]=1; out[(rule_sig==-1)&(ml_sig==-1)]=-1
+return out
+
+@dataclass
+class BTParams:
+stop_ticks:int=25; take_ticks:int=100; slippage_ticks:int=1
+fee_per_contract:float=1.0; max_concurrent:int=1; contracts:int=1
+
+def backtest(df: pd.DataFrame, instrument: Instrument, signal: pd.Series, params: BTParams)->dict:
+df = df.loc[signal.index]
+stop = params.stop_ticks*instrument.tick_size
+take = params.take_ticks*instrument.tick_size
+slip = params.slippage_ticks*instrument.tick_size
+pos=0; entry_price=0.0; trades=[]
+for ts, sig in signal.items():
+o = df.loc[ts,'open']
+if pos==0 and sig!=0:
+pos=sig; entry_price = o+(slip if sig==1 else -slip)
+trades.append({'entry_time':ts,'side':'long' if sig==1 else 'short','entry':entry_price})
+elif pos!=0:
+hi=df.loc[ts,'high']; lo=df.loc[ts,'low']
+if pos==1:
+tp=entry_price+take; sl=entry_price-stop; hit_tp=hi>=tp; hit_sl=lo<=sl
+else:
+tp=entry_price-take; sl=entry_price+stop; hit_tp=lo<=tp; hit_sl=hi>=sl
+exit_price=None; exit_reason=None
+if hit_tp and hit_sl:
+exit_price = sl-(slip if pos==1 else -slip); exit_reason='stop'
+elif hit_tp:
+exit_price = tp-(slip if pos==1 else -slip); exit_reason='take'
+elif hit_sl:
+exit_price = sl-(slip if pos==1 else -slip); exit_reason='stop'
+if exit_price is not None:
+pnl_ticks=(exit_price-entry_price)/instrument.tick_size*(1 if pos==1 else -1)
+dollars = pnl_ticks*instrument.tick_value*params.contracts - params.fee_per_contract*params.contracts
+trades[-1].update({'exit_time':ts,'exit':exit_price,'pnl_ticks':pnl_ticks,'pnl_usd':dollars,'reason':exit_reason})
+pos=0; entry_price=0.0
+else:
+if sig==-pos:
+mkt_exit = o-(slip if pos==1 else -slip)
+pnl_ticks=(mkt_exit-entry_price)/instrument.tick_size*(1 if pos==1 else -1)
+dollars = pnl_ticks*instrument.tick_value*params.contracts - params.fee_per_contract*params.contracts
+trades[-1].update({'exit_time':ts,'exit':mkt_exit,'pnl_ticks':pnl_ticks,'pnl_usd':dollars,'reason':'flip'})
+pos=sig; entry_price = o+(slip if sig==1 else -slip)
+trades.append({'entry_time':ts,'side':'long' if sig==1 else 'short','entry':entry_price})
+if pos!=0:
+ts=df.index[-1]; c=df.iloc[-1]['close']; mkt_exit=c-(slip if pos==1 else -slip)
+pnl_ticks=(mkt_exit-entry_price)/instrument.tick_size*(1 if pos==1 else -1)
+dollars = pnl_ticks*instrument.tick_value*params.contracts - params.fee_per_contract*params.contracts
+trades[-1].update({'exit_time':ts,'exit':mkt_exit,'pnl_ticks':pnl_ticks,'pnl_usd':dollars,'reason':'eod'})
+trades_df=pd.DataFrame(trades)
+if not trades_df.empty:
+stats={'trades':len(trades_df),'win_rate':float((trades_df['pnl_usd']>0).mean()),
+'avg_$':float(trades_df['pnl_usd'].mean()),'sum_$':float(trades_df['pnl_usd'].sum()),
+'avg_ticks':float(trades_df['pnl_ticks'].mean()),
+'max_dd_$':float(trades_df['pnl_usd'].cumsum().cummin().min())}
+else:
+stats={'trades':0,'win_rate':0.0,'avg_$':0.0,'sum_$':0.0,'avg_ticks':0.0,'max_dd_$':0.0}
+return {'trades':trades_df,'stats':stats}
+
+class IBPaper:
+def __init__(self, host='127.0.0.1', port=7497, client_id=7, is_paper=True):
+if not IB_AVAILABLE: raise RuntimeError("ib_insync not installed. pip install ib-insync")
+self.ib=IB(); self.host, self.port, self.client_id = host, port, client_id; self.is_paper=is_paper
+def connect(self):
+print(f"Connecting to IB @ {self.host}:{self.port} client_id={self.client_id} ...")
+self.ib.connect(self.host,self.port,clientId=self.client_id)
+def contract(self, symbol:str, exchange='CME', currency='USD'):
+return Future(symbol=symbol,lastTradeDateOrContractMonth='',exchange=exchange,currency=currency)
+def place_market(self, symbol:str, qty:int, action:str='BUY'):
+c=self.contract(symbol); self.ib.qualifyContracts(c); order=MarketOrder(action,qty); return self.ib.placeOrder(c,order)
+def place_bracket(self, symbol:str, qty:int, action:str, entry_price:float, take_price:float, stop_price:float):
+c=self.contract(symbol); self.ib.qualifyContracts(c)
+parent=LimitOrder(action,qty,lmtPrice=entry_price); parent.transmit=False
+take_action='SELL' if action=='BUY' else 'BUY'
+tp=LimitOrder(take_action,qty,lmtPrice=take_price); tp.parentId=parent.orderId; tp.transmit=False
+sl=LimitOrder(take_action,qty,lmtPrice=stop_price); sl.parentId=parent.orderId; sl.transmit=True
+t1=self.ib.placeOrder(c,parent); t2=self.ib.placeOrder(c,tp); t3=self.ib.placeOrder(c,sl); return (t1,t2,t3)
+
+def df_from_yahoo(ticker="NQ=F", interval="1m", period="7d", start:Optional[str]=None, end:Optional[str]=None)->pd.DataFrame:
+if not YF_AVAILABLE: raise SystemExit("yfinance not installed — pip install yfinance")
+kwargs={"interval":interval}
+if start or end: kwargs.update({"start":start,"end":end})
+else: kwargs.update({"period":period})
+data = yf.download(ticker, **kwargs)
+if data is None or len(data)==0: raise RuntimeError(f"Yahoo returned no data for {ticker} ({interval}, {period} {start or ''} {end or ''})")
+data=data.reset_index()
+data['close']=data['Adj Close'] if 'Adj Close' in data.columns else data['Close']
+data=data.rename(columns={"Datetime":"datetime","Date":"datetime","Open":"open","High":"high","Low":"low","Volume":"volume"})
+cols=[c for c in ["datetime","open","high","low","close","volume"] if c in data.columns]
+data=data[cols]; data["datetime"]=pd.to_datetime(data["datetime"])
+df=data.set_index("datetime").sort_index()
+for col in ["open","high","low","close","volume"]: df[col]=pd.to_numeric(df[col], errors="coerce")
+return df.dropna()
+
+def load_csv(path:str, tz:Optional[str]=None)->pd.DataFrame:
+df=pd.read_csv(path); df['datetime']=pd.to_datetime(df['datetime']); df=df.set_index('datetime').sort_index()
+if tz is not None:
+df.index=df.index.tz_localize(tz,nonexistent='shift_forward',ambiguous='NaT').tz_convert('UTC').tz_localize(None)
+for col in ['open','high','low','close','volume']: df[col]=pd.to_numeric(df[col], errors='coerce')
+return df.dropna()
+
+def cmd_backtest(args):
+if args.csv: df=load_csv(args.csv, tz=args.tz)
+elif args.yahoo_ticker: df=df_from_yahoo(args.yahoo_ticker,args.yahoo_interval,args.yahoo_period,args.yahoo_start or None,args.yahoo_end or None)
+else: raise SystemExit("Provide --csv PATH or --yahoo_ticker TICKER (e.g., NQ=F)")
+df=to_timeframe(df,args.tf)
+feats=build_features(df)
+labels=make_labels(df,horizon=args.horizon,thr_ticks=args.thr_ticks,tick_size=INSTRUMENTS[args.symbol].tick_size)
+idx=feats.index.intersection(labels.index); feats,labels=feats.loc[idx],labels.loc[idx]
+model,cols=train_model(feats,labels)
+sig=hybrid_signal(model,feats,rule_signal(df,feats),prob_th=args.prob)
+bt=backtest(df.loc[sig.index],INSTRUMENTS[args.symbol],sig,BTParams(stop_ticks=args.stop_ticks,take_ticks=args.take_ticks,slippage_ticks=args.slippage_ticks,fee_per_contract=args.fee,contracts=args.contracts))
+print("=== Backtest Stats ===")
+for k,v in bt['stats'].items(): print(f"{k:>10}: {v:.4f}" if isinstance(v,float) else f"{k:>10}: {v}")
+if args.save_trades: bt['trades'].to_csv(args.save_trades, index=False); print(f"Saved trades to {args.save_trades}")
+if args.model_out:
+os.makedirs(os.path.dirname(args.model_out) or '.', exist_ok=True)
+with open(args.model_out,'wb') as f: pickle.dump({'model':model,'cols':cols}, f)
+print(f"Saved model to {args.model_out}")
+
+def cmd_train(args):
+if args.csv: df=load_csv(args.csv, tz=args.tz)
+elif args.yahoo_ticker: df=df_from_yahoo(args.yahoo_ticker,args.yahoo_interval,args.yahoo_period,args.yahoo_start or None,args.yahoo_end or None)
+else: raise SystemExit("Provide --csv PATH or --yahoo_ticker TICKER (e.g., NQ=F)")
+df=to_timeframe(df,args.tf)
+feats=build_features(df)
+labels=make_labels(df,horizon=args.horizon,thr_ticks=args.thr_ticks,tick_size=INSTRUMENTS[args.symbol].tick_size)
+idx=feats.index.intersection(labels.index); feats,labels=feats.loc[idx],labels.loc[idx]
+model,cols=train_model(feats,labels)
+os.makedirs(os.path.dirname(args.model_out) or '.', exist_ok=True)
+with open(args.model_out,'wb') as f: pickle.dump({'model':model,'cols':cols}, f)
+print(f"Saved model to {args.model_out}")
+
+def cmd_live_ib(args):
+if not IB_AVAILABLE: raise SystemExit("ib_insync not installed — pip install ib-insync")
+ibp=IBPaper(host=args.host,port=args.port,client_id=args.client_id,is_paper=args.paper); ibp.connect()
+print("Connected. Wire your signal loop + bracket orders using ibp.place_bracket().")
+
+def _make_synth(rows:int=2000)->pd.DataFrame:
+np.random.seed(42)
+idx=pd.date_range('2025-01-01 14:30:00', periods=rows, freq='T')
+price=18000+np.cumsum(np.random.normal(0,1.5,size=rows))
+high=price+np.random.uniform(0.0,2.5,size=rows); low=price-np.random.uniform(0.0,2.5,size=rows)
+open_=price+np.random.uniform(-0.5,0.5,size=rows); close=price+np.random.uniform(-0.5,0.5,size=rows)
+volume=np.random.randint(50,500,size=rows)
+return pd.DataFrame({'open':open_,'high':high,'low':low,'close':close,'volume':volume}, index=idx)
+
+def _run_pipeline(df:pd.DataFrame, symbol:str='MNQ', tf:str='1min', prob:float=0.55):
+df=to_timeframe(df,tf); feats=build_features(df)
+labels=make_labels(df,horizon=5,thr_ticks=2.0,tick_size=INSTRUMENTS[symbol].tick_size)
+idx=feats.index.intersection(labels.index); feats,labels=feats.loc[idx],labels.loc[idx]
+model,cols=train_model(feats,labels); sig=hybrid_signal(model,feats,rule_signal(df,feats),prob_th=prob)
+return backtest(df.loc[sig.index],INSTRUMENTS[symbol],sig,BTParams())
+
+def cmd_selftest(args):
+print(f"TA available: {TA_AVAILABLE}, forced_fallback: {FORCE_FALLBACK_TA}")
+df=_make_synth(rows=args.rows); bt=_run_pipeline(df,'MNQ','1min',0.55)
+print("=== Selftest Backtest Stats (1m) ===")
+for k,v in bt['stats'].items(): print(f"{k:>10}: {v:.4f}" if isinstance(v,float) else f"{k:>10}: {v}")
+
+def cmd_selftest5m(args):
+print(f"TA available: {TA_AVAILABLE}, forced_fallback: {FORCE_FALLBACK_TA}")
+df=_make_synth(rows=args.rows); bt=_run_pipeline(df,'MNQ','5min',0.55)
+print("=== Selftest Backtest Stats (5m) ===")
+for k,v in bt['stats'].items(): print(f"{k:>10}: {v:.4f}" if isinstance(v,float) else f"{k:>10}: {v}")
+
+def cmd_selftest_fallback(args):
+global FORCE_FALLBACK_TA; FORCE_FALLBACK_TA=True
+print(f"TA available: {TA_AVAILABLE}, forced_fallback: {FORCE_FALLBACK_TA}")
+df=_make_synth(rows=args.rows); bt=_run_pipeline(df,'MNQ','1min',0.55)
+print("=== Selftest Backtest Stats (fallback, 1m) ===")
+for k,v in bt['stats'].items(): print(f"{k:>10}: {v:.4f}" if isinstance(v,float) else f"{k:>10}: {v}")
+
+if __name__=='__main__':
+p=argparse.ArgumentParser(description='MNQ/NQ Day Trading AI Bot — Backtest + Paper Trading')
+sub=p.add_subparsers(dest='cmd', required=False)
+common=argparse.ArgumentParser(add_help=False)
+common.add_argument('--symbol', default='MNQ', choices=list(INSTRUMENTS.keys()))
+common.add_argument('--tf', default='1min')
+common.add_argument('--tz', default=None)
+b=sub.add_parser('backtest', parents=[common])
+b.add_argument('--csv', default=''); b.add_argument('--yahoo_ticker', default='')
+b.add_argument('--yahoo_interval', default='1m'); b.add_argument('--yahoo_period', default='7d')
+b.add_argument('--yahoo_start', default=''); b.add_argument('--yahoo_end', default='')
+b.add_argument('--horizon', type=int, default=5); b.add_argument('--thr_ticks', type=float, default=8.0)
+b.add_argument('--prob', type=float, default=0.55); b.add_argument('--stop_ticks', type=int, default=25)
+b.add_argument('--take_ticks', type=int, default=100); b.add_argument('--slippage_ticks', type=int, default=1)
+b.add_argument('--fee', type=float, default=1.0); b.add_argument('--contracts', type=int, default=1)
+b.add_argument('--save_trades', default=''); b.add_argument('--model_out', default='')
+b.set_defaults(func=cmd_backtest)
+t=sub.add_parser('train', parents=[common])
+t.add_argument('--csv', default=''); t.add_argument('--yahoo_ticker', default='')
+t.add_argument('--yahoo_interval', default='1m'); t.add_argument('--yahoo_period', default='7d')
+t.add_argument('--yahoo_start', default=''); t.add_argument('--yahoo_end', default='')
+t.add_argument('--horizon', type=int, default=5); t.add_argument('--thr_ticks', type=float, default=8.0)
+t.add_argument('--model_out', required=True); t.set_defaults(func=cmd_train)
+l=sub.add_parser('live', parents=[common]); l.add_argument('--broker', choices=['ib'], required=True)
+l.add_argument('--paper', action='store_true'); l.add_argument('--host', default='127.0.0.1')
+l.add_argument('--port', type=int, default=7497); l.add_argument('--client_id', type=int, default=7)
+l.add_argument('--contracts', type=int, default=1); l.set_defaults(func=cmd_live_ib)
+s1=sub.add_parser('selftest'); s1.add_argument('--rows', type=int, default=2000); s1.set_defaults(func=cmd_selftest)
+s5=sub.add_parser('selftest5m'); s5.add_argument('--rows', type=int, default=2000); s5.set_defaults(func=cmd_selftest5m)
+sf=sub.add_parser('selftest_fallback'); sf.add_argument('--rows', type=int, default=2000); sf.set_defaults(func=cmd_selftest_fallback)
+if len(sys.argv)==1: sys.argv=[sys.argv[0],'selftest']
+args=p.parse_args()
+if getattr(args,'cmd',None) is None: sys.exit(0)
+args.func(args)
+PY

@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: alphaflow-worker
+    env: python
+    plan: free
+    region: frankfurt
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: |
+      gunicorn -k uvicorn.workers.UvicornWorker app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 30
+    healthCheckPath: /healthz
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_CHANNEL_FREE
+        sync: false
+      - key: DISCORD_CHANNEL_PRO
+        sync: false
+      - key: DEFAULT_STOP_ATR
+        value: "1.5"
+      - key: DEFAULT_TP1_RR
+        value: "1.0"
+      - key: DEFAULT_TP2_RR
+        value: "2.0"
+      - key: BINANCE_REF
+        value: "1164241722"
+  - type: cron
+    name: alphaflow-scanner
+    env: python
+    plan: free
+    region: frankfurt
+    schedule: "*/10 * * * *"
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: |
+      python scanner.py
+    envVars:
+      - key: SERVICE_URL
+        value: "https://alphaflow-worker.onrender.com"
